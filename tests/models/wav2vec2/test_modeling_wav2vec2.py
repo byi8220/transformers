@@ -25,6 +25,7 @@ import unittest
 
 import numpy as np
 from datasets import load_dataset
+import pytest
 
 from transformers import Wav2Vec2Config, is_torch_available
 from transformers.testing_utils import (
@@ -33,6 +34,8 @@ from transformers.testing_utils import (
     is_pt_flax_cross_test,
     is_pyctcdecode_available,
     is_torchaudio_available,
+    require_flash_attn,
+    require_torch_gpu,
     require_pyctcdecode,
     require_soundfile,
     require_torch,
@@ -829,6 +832,99 @@ class Wav2Vec2ModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase
     )
     def test_flax_from_pt_safetensors(self):
         return
+    
+    @require_flash_attn
+    @require_torch_gpu
+    @pytest.mark.flash_attn_test
+    @slow
+    def test_flash_attn_2_inference_equivalence(self):
+        '''Assert that the output of a model using eager attention is the same as the output of a model using FlashAttention2'''
+        for model_class in self.all_model_classes:
+            if not model_class._supports_flash_attn_2:
+                return
+            config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+            model = model_class(config)
+
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                model.save_pretrained(tmpdirname)
+                
+                model_fa = model_class.from_pretrained(tmpdirname, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+                model_fa.to(torch_device)
+
+                model = model_class.from_pretrained(tmpdirname, torch_dtype=torch.bfloat16, attn_implementation="eager")
+                model.to(torch_device)
+
+                dummy_input = inputs_dict[model.main_input_name][:1]
+                if dummy_input.dtype in [torch.float32, torch.float16]:
+                    dummy_input = dummy_input.to(torch.bfloat16)
+
+                decoder_input_ids = inputs_dict.get("decoder_input_ids", dummy_input)[:1]
+
+                outputs = model(dummy_input, decoder_input_ids=decoder_input_ids, output_hidden_states=True)
+                outputs_fa = model_fa(dummy_input, decoder_input_ids=decoder_input_ids, output_hidden_states=True)
+
+                logits = outputs.decoder_hidden_states[-1]
+                logits_fa = outputs_fa.decoder_hidden_states[-1]
+
+                assert torch.allclose(logits_fa, logits, atol=1e-4)
+
+                # check with inference + dropout
+                model.train()
+                _ = model_fa(dummy_input, decoder_input_ids=decoder_input_ids)
+
+    @require_flash_attn
+    @require_torch_gpu
+    @pytest.mark.flash_attn_test
+    @slow
+    def test_flash_attn_2_inference_equivalence_right_padding(self):
+        import torch
+
+        for model_class in self.all_model_classes:
+            if not model_class._supports_flash_attn_2:
+                return
+
+            config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+            model = model_class(config)
+
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                model.save_pretrained(tmpdirname)
+                model_fa = model_class.from_pretrained(
+                    tmpdirname, torch_dtype=torch.float16, attn_implementation="flash_attention_2"
+                )
+                model_fa.to(torch_device)
+
+                model = model_class.from_pretrained(tmpdirname, torch_dtype=torch.float16, attn_implementation="eager")
+                model.to(torch_device)
+
+                dummy_input = inputs_dict[model.main_input_name][:1]
+                dummy_input = dummy_input.to(torch.float16)
+
+                decoder_input_ids = torch.tensor([[0, 1, 2, 3, 4, 5]], device=dummy_input.device, dtype=torch.long)
+                decoder_attention_mask = torch.tensor(
+                    [[0, 0, 0, 1, 1, 1]], device=dummy_input.device, dtype=torch.long
+                )
+
+                outputs = model(dummy_input, decoder_input_ids=decoder_input_ids, output_hidden_states=True)
+                outputs_fa = model_fa(dummy_input, decoder_input_ids=decoder_input_ids, output_hidden_states=True)
+
+                logits = outputs.decoder_hidden_states[-1]
+                logits_fa = outputs_fa.decoder_hidden_states[-1]
+
+                assert torch.allclose(logits_fa, logits, atol=1e-4)
+
+                other_inputs = {
+                    "decoder_input_ids": decoder_input_ids,
+                    "decoder_attention_mask": decoder_attention_mask,
+                    "output_hidden_states": True,
+                }
+
+                outputs = model(dummy_input, **other_inputs)
+                outputs_fa = model_fa(dummy_input, **other_inputs)
+
+                logits = outputs.decoder_hidden_states[-1]
+                logits_fa = outputs_fa.decoder_hidden_states[-1]
+
+                assert torch.allclose(logits_fa[:, -2:], logits[:, -2:], atol=1e-4)
 
 
 @require_torch
