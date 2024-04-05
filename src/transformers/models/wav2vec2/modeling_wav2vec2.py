@@ -890,10 +890,16 @@ class Wav2Vec2FeedForward(nn.Module):
         return hidden_states
 
 
+WAV_2_VEC_2_ATTENTION_CLASSES = {
+    "eager": Wav2Vec2Attention,
+    "flash_attention": Wav2Vec2FlashAttention2,
+}
+
 class Wav2Vec2EncoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attention = Wav2Vec2Attention(
+
+        self.attention = WAV_2_VEC_2_ATTENTION_CLASSES[config._attn_implementation](
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
             dropout=config.attention_dropout,
@@ -1295,6 +1301,7 @@ class Wav2Vec2PreTrainedModel(PreTrainedModel):
     base_model_prefix = "wav2vec2"
     main_input_name = "input_values"
     supports_gradient_checkpointing = True
+    _supports_flash_attn_2 = True
 
     def _init_weights(self, module):
         """Initialize the weights"""
